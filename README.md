@@ -1,6 +1,8 @@
 # IPv6 ADD 管理工具
 
-Linux VPS 上的交互式 IPv6 管理脚本。仓库地址：[lulu123k/addipv6](https://github.com/lulu123k/addipv6)。当前仓库是私有仓库，需要有权限的 GitHub 账号才能访问。
+Linux VPS 上的交互式 IPv6 管理脚本。仓库地址：[lulu123k/addipv6](https://github.com/lulu123k/addipv6)。
+
+本项目保留了原项目的提交历史和 [MIT 许可证](LICENSE)。
 
 ## 功能
 
@@ -11,19 +13,17 @@ Linux VPS 上的交互式 IPv6 管理脚本。仓库地址：[lulu123k/addipv6](
 
 ## 环境要求
 
-Linux、Bash、Python 3.6+、iproute2，以及 root 权限。路由持久化功能还需要 systemd。
+Linux、Bash、Python 3.6+、iproute2、curl，以及 root 权限。路由持久化功能还需要 systemd。
 
-## 获取和运行
+## 安装与运行
 
-建议在自己的电脑上使用已授权的 GitHub CLI 克隆私有仓库，再把脚本复制到 VPS。无需把 GitHub 凭据放在 VPS 上：
+以 root 登录 VPS 后，复制这一行即可下载并运行脚本：
 
 ```bash
-gh repo clone lulu123k/addipv6
-scp addipv6/addipv6.sh root@你的VPS:/root/addipv6.sh
-ssh root@你的VPS 'bash /root/addipv6.sh'
+curl -fsSLo addipv6.sh https://raw.githubusercontent.com/lulu123k/addipv6/main/addipv6.sh && bash addipv6.sh
 ```
 
-运行前请阅读脚本。它会修改网卡地址与默认路由，错误操作可能中断 SSH 连接。最好先准备 VPS 控制台作为备用入口。
+脚本会以 root 身份修改网卡地址与默认路由。建议先阅读下载的文件，并准备 VPS 控制台作为备用入口；错误操作可能中断 SSH 连接。
 
 ## 状态与开机恢复
 
@@ -43,4 +43,4 @@ journalctl -u addipv6-route.service --no-pager
 - 新增公网 IPv6 后，检查 VPS 的 IPv6 防火墙规则，以及监听 `::` 的服务是否意外对外开放。
 - 地址生成使用 Python `secrets`，并校验前缀；状态文件不再放在共享的 `/tmp`。
 - “仅保留当前出口”会删除网卡上其他全部全局 IPv6 地址。此操作需要输入 `DELETE` 确认。
-- 旧版的 `curl | bash` 链接指向另一个仓库，不适用于这个私有仓库；不要从不明来源获取并以 root 执行脚本。
+- 安装命令从本仓库的 `main` 分支下载脚本；执行前可先检查下载的 `addipv6.sh` 内容。
