@@ -1,258 +1,294 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -u
+umask 077
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
 
-echo "====================================="
-echo "欢迎使用 ADD IPv6 管理工具"
-echo "作者: Joey"
-echo "博客: joeyblog.net"
-echo "TG群: https://t.me/+ft-zI76oovgwNmRh"
-echo "提醒: 合理使用"
-echo "====================================="
+STATE_DIR=/var/lib/addipv6
+STATE_FILE=$STATE_DIR/managed-addresses
+ROUTE_UNIT=/etc/systemd/system/addipv6-route.service
+MAX_ADD=1000
 
-# 1. 必须以 root 权限执行
-if [ "$(id -u)" -ne 0 ]; then
-    echo "请以root权限执行此脚本。"
-    exit 1
-fi
+die() { printf '错误：%s\n' "$*" >&2; exit 1; }
+warn() { printf '警告：%s\n' "$*" >&2; }
+
+valid_iface() { [[ $1 =~ ^[a-zA-Z0-9_.-]{1,15}$ ]]; }
+
+valid_ipv6() {
+    python3 - "$1" <<'PY'
+import ipaddress
+import sys
+try:
+    sys.exit(0 if ipaddress.ip_address(sys.argv[1]).version == 6 else 1)
+except ValueError:
+    sys.exit(1)
+PY
+}
+
+valid_prefix() {
+    python3 - "$1" <<'PY'
+import ipaddress
+import sys
+try:
+    sys.exit(0 if ipaddress.ip_interface(sys.argv[1]).version == 6 else 1)
+except ValueError:
+    sys.exit(1)
+PY
+}
+
+prepare_state() {
+    [[ ! -L $STATE_DIR ]] || die "$STATE_DIR 不能是符号链接。"
+    if [[ -e $STATE_DIR ]]; then
+        [[ -d $STATE_DIR && $(stat -c %u "$STATE_DIR") -eq 0 ]] || die "$STATE_DIR 必须是 root 拥有的目录。"
+    else
+        mkdir -m 700 "$STATE_DIR" || die "无法创建 $STATE_DIR。"
+    fi
+    chmod 700 "$STATE_DIR" || die "无法限制 $STATE_DIR 的权限。"
+    [[ ! -L $STATE_FILE ]] || die "$STATE_FILE 不能是符号链接。"
+    if [[ -e $STATE_FILE ]]; then
+        [[ -f $STATE_FILE && $(stat -c %u "$STATE_FILE") -eq 0 ]] || die "$STATE_FILE 必须是 root 拥有的普通文件。"
+        chmod 600 "$STATE_FILE" || die "无法限制 $STATE_FILE 的权限。"
+    fi
+}
+
+save_record() {
+    local iface=$1 prefix=$2 action=$3 tmp line
+    prepare_state
+    tmp=$(mktemp "$STATE_DIR/.managed-addresses.XXXXXXXX") || die '无法创建临时状态文件。'
+    if [[ -f $STATE_FILE ]]; then
+        while IFS= read -r line || [[ -n $line ]]; do
+            if [[ $action != remove || $line != "$iface $prefix" ]]; then
+                printf '%s\n' "$line" >> "$tmp" || { rm -f -- "$tmp"; die '无法写入状态文件。'; }
+            fi
+        done < "$STATE_FILE"
+    fi
+    if [[ $action == add ]] && ! grep -Fxq -- "$iface $prefix" "$tmp"; then
+        printf '%s %s\n' "$iface" "$prefix" >> "$tmp" || { rm -f -- "$tmp"; die '无法写入状态文件。'; }
+    fi
+    mv -f -- "$tmp" "$STATE_FILE" || { rm -f -- "$tmp"; die '无法保存状态文件。'; }
+}
+
+global_addresses() { ip -o -6 addr show dev "$1" scope global | awk '{print $4}'; }
+current_source() { ip -6 route show default dev "$1" | awk '{for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}'; }
 
 # 2. 用来选择具有全局 IPv6 的网卡
 function choose_interface() {
-    GLOBAL_IPV6_INTERFACES=()
-    for iface in $(ip -o link show | awk -F': ' '{print $2}'); do
-        if ip -6 addr show dev "$iface" scope global | grep -q 'inet6'; then
-            GLOBAL_IPV6_INTERFACES+=("$iface")
+    local iface answer
+    local -a interfaces=()
+    while IFS= read -r iface; do
+        iface=${iface%%@*}
+        valid_iface "$iface" || continue
+        if ip -6 addr show dev "$iface" scope global | grep -q 'inet6 '; then
+            interfaces+=("$iface")
         fi
-    done
-    if [ ${#GLOBAL_IPV6_INTERFACES[@]} -eq 0 ]; then
-        echo "未检测到具有全局 IPv6 地址的网卡，请检查VPS的网络配置。"
-        exit 1
+    done < <(ip -o link show | awk -F': ' '{print $2}')
+    if ((${#interfaces[@]} == 0)); then
+        die '未找到有全局 IPv6 的网卡。'
     fi
-    if [ ${#GLOBAL_IPV6_INTERFACES[@]} -eq 1 ]; then
-        SELECTED_IFACE="${GLOBAL_IPV6_INTERFACES[0]}"
+    if ((${#interfaces[@]} == 1)); then
+        SELECTED_IFACE=${interfaces[0]}
     else
-        echo "检测到以下具有全局 IPv6 地址的网卡："
-        for i in "${!GLOBAL_IPV6_INTERFACES[@]}"; do
-            echo "$((i+1)). ${GLOBAL_IPV6_INTERFACES[$i]}"
+        echo '请选择网卡：'
+        for i in "${!interfaces[@]}"; do
+            printf '%d) %s\n' "$((i+1))" "${interfaces[i]}"
         done
-        read -p "请选择要使用的网卡编号: " choice
-        if ! [[ "$choice" =~ ^[1-9][0-9]*$ ]] || [ "$choice" -gt "${#GLOBAL_IPV6_INTERFACES[@]}" ]; then
-            echo "选择无效。"
-            exit 1
-        fi
-        SELECTED_IFACE="${GLOBAL_IPV6_INTERFACES[$((choice-1))]}"
+        read -r -p '编号: ' answer
+        [[ $answer =~ ^[1-9][0-9]*$ ]] && ((answer <= ${#interfaces[@]})) || die '网卡编号无效。'
+        SELECTED_IFACE=${interfaces[answer-1]}
     fi
-    echo "选择的网卡为：$SELECTED_IFACE"
+    printf '网卡：%s\n' "$SELECTED_IFACE"
 }
 
 # 3. 添加随机 IPv6 地址函数
 function add_random_ipv6() {
-    # 检查 python3 依赖
-    if ! command -v python3 &> /dev/null; then
-        echo "本功能需要 python3 来随机生成 IPv6 地址，请先安装 python3 后再试。"
-        exit 1
-    fi
-
+    local ipv6_cidr count generated prefix added=0 failed=0
     choose_interface
-    # 获取网卡上任意一个全局 IPv6 地址(含CIDR)
-    ipv6_cidr=$(ip -6 addr show dev "$SELECTED_IFACE" scope global | awk '/inet6/ {print $2}' | head -n1)
-    if [ -z "$ipv6_cidr" ]; then
-        echo "无法获取 $SELECTED_IFACE 的全局 IPv6 地址。"
-        exit 1
-    fi
+    ipv6_cidr=$(global_addresses "$SELECTED_IFACE" | head -n 1)
+    [[ -n $ipv6_cidr ]] && valid_prefix "$ipv6_cidr" || die '未找到合法的全局 IPv6 前缀。'
+    read -r -p "要添加多少个 IPv6 地址（1-$MAX_ADD）: " count || die '没有收到数量。'
+    [[ $count =~ ^[1-9][0-9]*$ ]] && ((count <= MAX_ADD)) || die '数量无效。'
+    # 输入通过 argv 传给 Python，不拼进代码；secrets 从系统随机源取值。
+    generated=$(python3 - "$ipv6_cidr" "$count" <<'PY'
+import ipaddress
+import secrets
+import sys
 
-    BASE_ADDR=$(echo "$ipv6_cidr" | cut -d'/' -f1)
-    PLEN=$(echo "$ipv6_cidr" | cut -d'/' -f2)
-    echo "检测到 IPv6 地址: $ipv6_cidr"
-    echo "使用的网络: $BASE_ADDR/$PLEN"
-
-    # 如果是 /128，就无法再随机生成其他地址
-    if [ "$PLEN" -eq 128 ]; then
-        echo "检测到前缀为 /128，不支持随机生成其它地址。"
-        exit 1
-    fi
-
-    read -p "请输入要添加的随机 IPv6 地址数量: " COUNT
-    if ! [[ "$COUNT" =~ ^[0-9]+$ ]]; then
-        echo "数量必须为整数。"
-        exit 1
-    fi
-
-    # 执行循环随机添加
-    for (( i=1; i<=COUNT; i++ )); do
-        RANDOM_ADDR=$(python3 -c "import ipaddress, random; \
-net=ipaddress.ip_network('$BASE_ADDR/$PLEN', strict=False); \
-print(ipaddress.IPv6Address(random.randint(int(net.network_address), int(net.broadcast_address))))")
-        
-        echo "添加地址: ${RANDOM_ADDR}/${PLEN}"
-        ip -6 addr add "${RANDOM_ADDR}/${PLEN}" dev "$SELECTED_IFACE"
-        if [ $? -eq 0 ]; then
-            # 记录添加成功的地址
-            echo "${RANDOM_ADDR}/${PLEN}" >> /tmp/added_v6_ipv6.txt
+interface = ipaddress.ip_interface(sys.argv[1])
+network = interface.network
+count = int(sys.argv[2])
+if network.prefixlen >= 127 or network.num_addresses - 1 < count:
+    sys.exit('网段可用地址不足。')
+used = {interface.ip}
+for _ in range(count):
+    for _ in range(100):
+        address = network.network_address + secrets.randbelow(network.num_addresses - 1) + 1
+        if address not in used:
+            used.add(address)
+            print(f'{address}/{network.prefixlen}')
+            break
+    else:
+        sys.exit('生成唯一地址失败。')
+PY
+) || die '生成随机地址失败。'
+    while IFS= read -r prefix; do
+        if ip -6 addr add "$prefix" dev "$SELECTED_IFACE"; then
+            save_record "$SELECTED_IFACE" "$prefix" add
+            printf '已添加：%s\n' "$prefix"
+            ((added+=1))
         else
-            echo "添加 ${RANDOM_ADDR}/${PLEN} 失败，请检查系统日志或网络配置。"
+            warn "添加 $prefix 失败。"
+            ((failed+=1))
         fi
-    done
-    echo "所有随机地址添加完成。"
+    done <<< "$generated"
+    printf '完成：成功 %d，失败 %d。\n' "$added" "$failed"
+    warn '新增公网 IPv6 后，请检查防火墙与监听所有 IPv6 地址的服务。'
 }
 
-# 4. 管理默认出口 IPv6 地址
+# 4. 用固定参数的 systemd 单元恢复路由，不向 rc.local 拼接 shell 命令。
+persist_route() {
+    local iface=$1 gateway=$2 source=$3 ip_bin tmp
+    command -v systemctl >/dev/null || { warn '没有 systemd，未启用开机恢复。'; return 1; }
+    valid_iface "$iface" && valid_ipv6 "$gateway" && valid_ipv6 "$source" || die '路由参数校验失败。'
+    [[ ! -L $ROUTE_UNIT ]] || die "$ROUTE_UNIT 不能是符号链接。"
+    if [[ -e $ROUTE_UNIT ]]; then
+        [[ -f $ROUTE_UNIT && $(stat -c %u "$ROUTE_UNIT") -eq 0 ]] || die "$ROUTE_UNIT 必须是 root 拥有的普通文件。"
+    fi
+    ip_bin=$(command -v ip)
+    [[ $ip_bin == /* ]] || die '找不到 ip 命令的绝对路径。'
+    tmp=$(mktemp /etc/systemd/system/.addipv6-route.XXXXXXXX) || die '无法创建临时服务文件。'
+    if ! cat > "$tmp" <<EOF
+[Unit]
+Description=Restore addipv6 IPv6 default route
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$ip_bin -6 route replace default via $gateway dev $iface src $source onlink
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    then
+        rm -f -- "$tmp"
+        die '无法写入服务文件。'
+    fi
+    chmod 644 "$tmp" || { rm -f -- "$tmp"; die '无法设置服务文件权限。'; }
+    mv -f -- "$tmp" "$ROUTE_UNIT" || { rm -f -- "$tmp"; die '无法保存服务文件。'; }
+    systemctl daemon-reload && systemctl enable addipv6-route.service || die '启用开机恢复失败。'
+    printf '已启用 %s。请确认源地址在重启后仍会配置到网卡。\n' "$ROUTE_UNIT"
+}
+
 function manage_default_ipv6() {
+    local -a ipv6_list=()
+    local answer source gateway route
     choose_interface
-
-    # 列出所有全局 IPv6 地址
-    echo "检测到以下IPv6地址（全局范围）："
-    mapfile -t ipv6_list < <(ip -6 addr show dev "$SELECTED_IFACE" scope global | awk '/inet6/ {print $2}')
-    if [ ${#ipv6_list[@]} -eq 0 ]; then
-        echo "网卡 $SELECTED_IFACE 上未检测到全局IPv6地址。"
-        exit 1
-    fi
-
+    mapfile -t ipv6_list < <(global_addresses "$SELECTED_IFACE")
+    ((${#ipv6_list[@]})) || die '网卡上没有全局 IPv6 地址。'
     for i in "${!ipv6_list[@]}"; do
-        echo "$((i+1)). ${ipv6_list[$i]}"
+        printf '%d) %s\n' "$((i+1))" "${ipv6_list[i]}"
     done
-
-    read -p "请输入要设置为出口的IPv6地址对应的序号: " addr_choice
-    if ! [[ "$addr_choice" =~ ^[0-9]+$ ]] || [ "$addr_choice" -gt "${#ipv6_list[@]}" ] || [ "$addr_choice" -lt 1 ]; then
-        echo "选择无效。"
-        exit 1
-    fi
-
-    # 拿到选中的地址（去掉 /前缀长度）
-    SELECTED_ENTRY="${ipv6_list[$((addr_choice-1))]}"
-    SELECTED_IP=$(echo "$SELECTED_ENTRY" | cut -d'/' -f1)
-    echo "选择的默认出口IPv6地址为：$SELECTED_IP"
-
-    # 尝试检测默认网关
-    GATEWAY=$(ip -6 route show default dev "$SELECTED_IFACE" | awk '/default/ {print $3}' | head -n1)
-    # 如果没有 default dev XXX，再去找所有 dev XXX 下的 via
-    if [ -z "$GATEWAY" ]; then
-        GATEWAY=$(ip -6 route show dev "$SELECTED_IFACE" | awk '/via/ {print $3}' | head -n1)
-    fi
-    if [ -z "$GATEWAY" ]; then
-        echo "未检测到默认IPv6网关，请检查系统路由配置。"
-        exit 1
-    fi
-
-    echo "检测到默认IPv6网关为：$GATEWAY"
-
-    # 优先尝试 'add default'；若已存在，改用 'change default'
-    ip -6 route add default via "$GATEWAY" dev "$SELECTED_IFACE" src "$SELECTED_IP" onlink 2>/tmp/ip6_err.log || \
-    ip -6 route change default via "$GATEWAY" dev "$SELECTED_IFACE" src "$SELECTED_IP" onlink 2>>/tmp/ip6_err.log
-
-    if [ $? -eq 0 ]; then
-        echo "默认出口IPv6地址更新成功，出站流量将使用 $SELECTED_IP 作为源地址。"
-    else
-        echo "更新默认出口IPv6地址失败，请检查系统路由配置（错误详情可查看 /tmp/ip6_err.log）。"
-    fi
-
-    # 询问是否持久化到 /etc/rc.local
-    read -p "是否将此配置写入 /etc/rc.local 以避免重启后失效？(y/n): " persist_choice
-    if [[ "$persist_choice" =~ ^[Yy]$ ]]; then
-        if [ ! -f /etc/rc.local ]; then
-            echo "#!/bin/bash" > /etc/rc.local
-            chmod +x /etc/rc.local
-        fi
-        # 避免重复追加
-        local_cmd="ip -6 route add default via \"$GATEWAY\" dev \"$SELECTED_IFACE\" src \"$SELECTED_IP\" onlink"
-        if ! grep -Fxq "$local_cmd" /etc/rc.local; then
-            echo "$local_cmd" >> /etc/rc.local
-            echo "配置已写入 /etc/rc.local 。"
-        else
-            echo "检测到 /etc/rc.local 中已存在相同配置，无需重复写入。"
-        fi
+    read -r -p '出口地址编号: ' answer || die '没有收到地址编号。'
+    [[ $answer =~ ^[1-9][0-9]*$ ]] && ((answer <= ${#ipv6_list[@]})) || die '地址编号无效。'
+    source=${ipv6_list[answer-1]%/*}
+    valid_ipv6 "$source" || die '出口地址无效。'
+    route=$(ip -6 route show default dev "$SELECTED_IFACE" | head -n 1)
+    gateway=$(awk '{for (i=1; i<=NF; i++) if ($i=="via") {print $(i+1); exit}}' <<< "$route")
+    [[ -n $gateway ]] && valid_ipv6 "$gateway" || die '未找到合法的 IPv6 默认网关。'
+    ip -6 route replace default via "$gateway" dev "$SELECTED_IFACE" src "$source" onlink || die '设置默认出口失败。'
+    printf '默认出口源地址已设为 %s。\n' "$source"
+    read -r -p '要创建 systemd 服务，以便开机恢复此路由吗？(y/N): ' answer || answer=N
+    if [[ $answer =~ ^[Yy]$ ]]; then
+        persist_route "$SELECTED_IFACE" "$gateway" "$source"
     fi
 }
 
-# 5. 一键删除脚本添加过的所有 IPv6 地址
+# 5. 只删除记录在 root 私有状态文件里的地址，保留出口和最后一个全局地址。
 function delete_all_ipv6() {
+    local iface prefix extra source remaining deleted=0 skipped=0
+    prepare_state
+    [[ -f $STATE_FILE ]] || die '没有本脚本记录的地址。旧版 /tmp 记录不会自动导入。'
     choose_interface
-    if [ ! -f /tmp/added_v6_ipv6.txt ]; then
-        echo "未检测到 /tmp/added_v6_ipv6.txt 文件，说明没有记录或已被删除。"
-        exit 1
-    fi
-
-    while read -r entry; do
-        if [ -n "$entry" ]; then
-            echo "删除地址: $entry"
-            ip -6 addr del "$entry" dev "$SELECTED_IFACE"
+    source=$(current_source "$SELECTED_IFACE")
+    remaining=$(global_addresses "$SELECTED_IFACE" | wc -l | tr -d ' ')
+    while read -r iface prefix extra || [[ -n ${iface:-} ]]; do
+        [[ $iface == "$SELECTED_IFACE" ]] || continue
+        if [[ -z ${prefix:-} || -n ${extra:-} ]] || ! valid_prefix "$prefix"; then
+            warn "跳过无效记录：$iface ${prefix:-}"
+            ((skipped+=1))
+            continue
         fi
-    done < /tmp/added_v6_ipv6.txt
-
-    rm -f /tmp/added_v6_ipv6.txt
-    echo "所有添加的IPv6地址已删除。"
-}
-
-# 6. 只保留当前默认出口IPv6地址，删除其它所有
-function delete_except_default_ipv6() {
-    choose_interface
-
-    # 获取当前默认路由的源地址
-    default_ip=$(ip -6 route show default dev "$SELECTED_IFACE" | \
-        awk '{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1); exit}}}')
-
-    if [ -z "$default_ip" ]; then
-        echo "未检测到默认出口IPv6地址，请先设置默认出口IPv6地址后再执行。"
-        exit 1
-    fi
-
-    echo "当前默认出口IPv6地址: $default_ip"
-
-    # 遍历所有全局IPv6地址，删除与默认出口地址不同的
-    mapfile -t ip_entries < <(ip -6 addr show dev "$SELECTED_IFACE" scope global | awk '/inet6/ {print $2}')
-    for entry in "${ip_entries[@]}"; do
-        addr_only=$(echo "$entry" | cut -d'/' -f1)
-        if [ "$addr_only" != "$default_ip" ]; then
-            echo "删除地址: $entry"
-            ip -6 addr del "$entry" dev "$SELECTED_IFACE"
+        if [[ ${prefix%/*} == "$source" || $remaining -le 1 ]]; then
+            warn "保留出口或最后一个全局 IPv6：$prefix"
+            ((skipped+=1))
+            continue
         fi
-    done
-
-    echo "只保留默认出口IPv6地址 $default_ip，其它已删除。"
-
-    # 询问是否将当前配置写入 /etc/rc.local
-    read -p "是否将当前配置写入 /etc/rc.local 以避免重启后失效？(y/n): " persist_choice
-    if [[ "$persist_choice" =~ ^[Yy]$ ]]; then
-        gateway=$(ip -6 route show default dev "$SELECTED_IFACE" | awk '/default/ {print $3}' | head -n1)
-        if [ -z "$gateway" ]; then
-            echo "未检测到默认IPv6网关，无法写入配置。"
+        if ! global_addresses "$SELECTED_IFACE" | grep -Fxq -- "$prefix"; then
+            warn "地址已不在网卡上，清除旧记录：$prefix"
+            save_record "$SELECTED_IFACE" "$prefix" remove
+            continue
+        fi
+        if ip -6 addr del "$prefix" dev "$SELECTED_IFACE"; then
+            save_record "$SELECTED_IFACE" "$prefix" remove
+            printf '已删除：%s\n' "$prefix"
+            ((deleted+=1))
+            ((remaining-=1))
         else
-            if [ ! -f /etc/rc.local ]; then
-                echo "#!/bin/bash" > /etc/rc.local
-                chmod +x /etc/rc.local
-            fi
-            local_cmd="ip -6 route add default via \"$gateway\" dev \"$SELECTED_IFACE\" src \"$default_ip\" onlink"
-            if ! grep -Fxq "$local_cmd" /etc/rc.local; then
-                echo "$local_cmd" >> /etc/rc.local
-                echo "配置已写入 /etc/rc.local 。"
-            else
-                echo "/etc/rc.local 中已存在相同配置，无需重复写入。"
-            fi
+            warn "删除 $prefix 失败。"
+            ((skipped+=1))
         fi
-    fi
+    done < <(cat -- "$STATE_FILE")
+    printf '完成：删除 %d，跳过 %d。\n' "$deleted" "$skipped"
 }
 
-# 7. 主菜单
-echo "请选择功能："
-echo "1. 添加随机 IPv6 地址"
-echo "2. 管理默认出口 IPv6 地址"
-echo "3. 一键删除全部添加的IPv6地址"
-echo "4. 只保留当前出口默认的IPv6地址 (删除其它全部)"
-read -p "请输入选择 (1, 2, 3 或 4): " choice_option
+# 6. 删除网卡上其他全部全局 IPv6，必须有有效的出口并明确确认。
+function delete_except_default_ipv6() {
+    local source entry answer deleted=0 found=0
+    choose_interface
+    source=$(current_source "$SELECTED_IFACE")
+    [[ -n $source ]] && valid_ipv6 "$source" || die '默认路由没有明确的 IPv6 出口地址，已取消删除。'
+    while IFS= read -r entry; do
+        [[ ${entry%/*} == "$source" ]] && found=1
+    done < <(global_addresses "$SELECTED_IFACE")
+    ((found == 1)) || die '出口地址不在所选网卡上。'
+    printf '将保留 %s，并删除 %s 上其余所有全局 IPv6 地址。\n' "$source" "$SELECTED_IFACE"
+    read -r -p '确认请输入 DELETE: ' answer || die '未收到确认，已取消。'
+    [[ $answer == DELETE ]] || { printf '已取消。\n'; return; }
+    while IFS= read -r entry; do
+        valid_prefix "$entry" || { warn "跳过无效地址：$entry"; continue; }
+        [[ ${entry%/*} == "$source" ]] && continue
+        if ip -6 addr del "$entry" dev "$SELECTED_IFACE"; then
+            save_record "$SELECTED_IFACE" "$entry" remove
+            printf '已删除：%s\n' "$entry"
+            ((deleted+=1))
+        else
+            warn "删除 $entry 失败。"
+        fi
+    done < <(global_addresses "$SELECTED_IFACE")
+    printf '完成：删除 %d 个地址，保留 %s。\n' "$deleted" "$source"
+}
 
-case "$choice_option" in
-    1)
-        add_random_ipv6
-        ;;
-    2)
-        manage_default_ipv6
-        ;;
-    3)
-        delete_all_ipv6
-        ;;
-    4)
-        delete_except_default_ipv6
-        ;;
-    *)
-        echo "无效的选择。"
-        exit 1
-        ;;
-esac
+main() {
+    [[ $(id -u) -eq 0 ]] || die '请以 root 身份运行。'
+    command -v ip >/dev/null || die '缺少 iproute2 的 ip 命令。'
+    command -v python3 >/dev/null || die '缺少 python3。'
+    python3 -c 'import secrets' >/dev/null 2>&1 || die '需要支持 secrets 模块的 Python 3.6 或更新版本。'
+    local choice_option
+    echo '请选择功能：'
+    echo '1. 添加随机 IPv6 地址'
+    echo '2. 管理默认出口 IPv6 地址'
+    echo '3. 删除本脚本记录的 IPv6 地址（保留出口和最后一个地址）'
+    echo '4. 仅保留当前出口 IPv6 地址（删除网卡上其他全部全局地址）'
+    read -r -p '请输入选择 (1-4): ' choice_option || die '没有收到选择。'
+    case $choice_option in
+        1) add_random_ipv6 ;;
+        2) manage_default_ipv6 ;;
+        3) delete_all_ipv6 ;;
+        4) delete_except_default_ipv6 ;;
+        *) die '无效的选择。' ;;
+    esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi

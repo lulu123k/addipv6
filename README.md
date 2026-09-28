@@ -1,74 +1,46 @@
- # IPv6  ADD 管理工具
+# IPv6 ADD 管理工具
 
-欢迎使用 IPv6 管理工具，这是一个用于管理 VPS 上 IPv6 地址的 Shell 脚本。该工具提供了以下功能：
+Linux VPS 上的交互式 IPv6 管理脚本。仓库地址：[lulu123k/addipv6](https://github.com/lulu123k/addipv6)。当前仓库是私有仓库，需要有权限的 GitHub 账号才能访问。
 
-- **添加随机 IPv6 地址**  
-  根据选定网卡的 /64 前缀，批量生成随机 IPv6 地址并添加到接口上，同时记录添加的地址以便后续管理。
+## 功能
 
-- **管理默认出口 IPv6 地址**  
-  列出选定网卡上所有全局 IPv6 地址，供用户选择一个作为默认出口地址，并更新默认路由（出站流量将使用该地址作为源地址）。更新后可选择将配置写入 `/etc/rc.local`，以确保重启后依然生效。
-
-- **一键删除全部添加的 IPv6 地址**  
-  删除通过该工具添加的所有随机 IPv6 地址（使用临时记录文件 `/tmp/added_v6_ipv6.txt`）。
-
-- **只保留当前默认出口 IPv6 地址**  
-  删除除当前默认出口 IPv6 地址之外的所有 IPv6 地址，并可选择将配置写入 `/etc/rc.local` 以持久化配置。
-
-## 作者信息
-
-- **作者**：Joey
-- **博客**：[joeyblog.net](https://joeyblog.net)
-- **Telegram 群**：[加入 TG 群](https://t.me/+ft-zI76oovgwNmRh)
-
-## 功能菜单
-
-运行脚本后会显示以下功能选项，供用户选择：
-
-1. **添加随机 IPv6 地址**  
-   根据检测到的网卡和 不是/128 前缀，自动生成并添加指定数量的随机 IPv6 地址。
-
-2. **管理默认出口 IPv6 地址**  
-   列出当前接口上所有全局 IPv6 地址，供用户选择一个作为出口地址，然后更新默认路由配置。更新后可选择写入 `/etc/rc.local` 来保证配置在重启后生效。
-
-3. **一键删除全部添加的 IPv6 地址**  
-   删除所有通过该工具添加的 IPv6 地址（记录在 `/tmp/added_v6_ipv6.txt` 文件中）。
-
-4. **只保留当前默认出口 IPv6 地址**  
-   删除除当前默认出口 IPv6 地址之外的所有 IPv6 地址，并可选择将配置写入 `/etc/rc.local`。
+- 在所选网卡的现有 IPv6 前缀内生成并添加地址，单次最多 1000 个。
+- 选择现有 IPv6 作为默认路由的出站源地址；可选创建 systemd 服务，在开机时恢复路由。
+- 删除本脚本记录的地址；会保留当前出口地址和网卡上的最后一个全局 IPv6 地址。
+- 经明确确认后，删除所选网卡上除当前出口外的其他全部全局 IPv6 地址。这项操作也会删除并非由脚本添加的地址。
 
 ## 环境要求
 
-- Linux 系统（Debian/Ubuntu/CentOS 等）
-- Bash shell
-- `ip` 命令工具（iproute2）
-- Root 权限（必须以 root 用户或使用 `sudo` 运行）
+Linux、Bash、Python 3.6+、iproute2，以及 root 权限。路由持久化功能还需要 systemd。
 
-## 安装与使用
+## 获取和运行
 
-1. **下载脚本**
+建议在自己的电脑上使用已授权的 GitHub CLI 克隆私有仓库，再把脚本复制到 VPS。无需把 GitHub 凭据放在 VPS 上：
 
-    ```bash
-   bash <(curl -l -s https://raw.githubusercontent.com/byJoey/addipv6/refs/heads/main/addipv6.sh)
-   ```
+```bash
+gh repo clone lulu123k/addipv6
+scp addipv6/addipv6.sh root@你的VPS:/root/addipv6.sh
+ssh root@你的VPS 'bash /root/addipv6.sh'
+```
 
-2. **按提示操作**
+运行前请阅读脚本。它会修改网卡地址与默认路由，错误操作可能中断 SSH 连接。最好先准备 VPS 控制台作为备用入口。
 
-   根据屏幕显示的菜单，输入相应的选项数字，按照提示进行网卡选择、地址生成、配置更新或删除操作。
+## 状态与开机恢复
 
-## 配置持久化
+新增地址按“网卡名 IPv6/前缀长度”记录在 `/var/lib/addipv6/managed-addresses`。目录仅 root 可访问，状态文件权限为 `0600`。旧版脚本的 `/tmp/added_v6_ipv6.txt` **不会自动导入或执行**；如果需要清理旧版地址，请先核对网卡上的实际地址，再手动处理。
 
-在更新默认出口 IPv6 地址后，脚本会询问是否将该配置写入 `/etc/rc.local`（或其他启动脚本），以避免重启后失效。如果选择写入，配置命令会追加到 `/etc/rc.local` 文件中（确保该文件具有执行权限）。
+选择“设置默认出口”并确认持久化时，脚本创建 `/etc/systemd/system/addipv6-route.service`。该服务只恢复默认路由；**出口源地址本身必须由 VPS 的网络配置在重启后重新添加**，否则路由恢复会失败。检查服务：
 
-## 注意事项
+```bash
+systemctl status addipv6-route.service
+journalctl -u addipv6-route.service --no-pager
+```
 
-- 本脚本会修改网络配置，建议在测试环境中验证后再在生产环境使用。
-- 更新默认路由可能会影响现有网络连接，操作前请确保有其他远程管理手段。
-- 删除操作将移除所有或除默认出口外的 IPv6 地址，请谨慎使用。
+旧版追加到 `/etc/rc.local` 的命令不会被新脚本删除；升级前请检查该文件，避免同时执行两份路由设置。
 
-## 许可证
+## 安全注意事项
 
-该项目采用 MIT 许可证。请参阅 LICENSE 文件了解详细信息。
-
----
-
-希望此工具能帮助你高效管理 VPS 上的 IPv6 地址。如有疑问或建议，欢迎在 [TG 群](https://t.me/+ft-zI76oovgwNmRh) 中交流。
+- 新增公网 IPv6 后，检查 VPS 的 IPv6 防火墙规则，以及监听 `::` 的服务是否意外对外开放。
+- 地址生成使用 Python `secrets`，并校验前缀；状态文件不再放在共享的 `/tmp`。
+- “仅保留当前出口”会删除网卡上其他全部全局 IPv6 地址。此操作需要输入 `DELETE` 确认。
+- 旧版的 `curl | bash` 链接指向另一个仓库，不适用于这个私有仓库；不要从不明来源获取并以 root 执行脚本。
